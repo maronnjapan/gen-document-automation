@@ -1,68 +1,146 @@
-"""共通処理: 設定・Redis（ジョブ状態）・S3（成果物）・SQS（通知）・独自LLM・Skills・Slack・Lambdaハンドラー。"""
+"""生成・レビュー・Web API の共通処理（設定、Redis、S3、SQS、独自LLM、Skills、Slack、Lambda ハンドラー）。"""
 import datetime, json, logging, os, pathlib, re
 import boto3, frontmatter, jmespath, pydantic, redis, requests, urllib3
 
-E = lambda key, default=None: os.environ.get(key) or default  # noqa: E731  空文字は未設定として扱う
-ROOT = pathlib.Path(E("APP_ROOT") or pathlib.Path(__file__).resolve().parents[1])  # prompts/ skills/ frontend/ の親
-R = redis.Redis.from_url(E("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
-S3, SQS, BUCKET = boto3.client("s3"), boto3.client("sqs"), E("S3_BUCKET", "doc-automation")  # 接続先は AWS_ENDPOINT_URL_S3/SQS で変更可
-HTTP, RETRY = requests.Session(), urllib3.Retry(3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=None)
-for scheme in ("http://", "https://"): HTTP.mount(scheme, requests.adapters.HTTPAdapter(max_retries=RETRY))  # LLM・Confluence・Slack: 一時的な失敗は再試行
-HTTP.hooks["response"].append(lambda res, *_, **__: res.raise_for_status())
-TAGS = r"</?\s*(?:instruction|comment|plan|skills?|task|reference|previous|review|viewpoints|document)\b[^>]*>"  # プロンプトでデータを囲むタグ
-now = lambda: datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")  # noqa: E731
-dumps = lambda v: json.dumps(v, ensure_ascii=False)  # noqa: E731
+def env(name, default=None):
+    """環境変数を読む（空文字は未設定として扱う）。"""
+    return os.environ.get(name) or default
 
-def job(jid):  # ジョブ（Redisのフラットなjson）
-    if v := R.get(f"job:{jid}"): return json.loads(v)
-    raise LookupError(jid)
+# prompts/ skills/ frontend/ の場所（Lambda のコンテナでは APP_ROOT で指定する）
+APP_ROOT = pathlib.Path(env("APP_ROOT") or pathlib.Path(__file__).resolve().parents[1])
+BUCKET = env("S3_BUCKET", "doc-automation")
+redis_client = redis.Redis.from_url(env("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
+s3 = boto3.client("s3")  # 接続先は AWS_ENDPOINT_URL_S3 で変更できる
+sqs = boto3.client("sqs")  # 接続先は AWS_ENDPOINT_URL_SQS で変更できる
 
-def save(j, **kw): j.update(kw, updated_at=now()); R.set(f"job:{j['job_id']}", dumps(j)); return j
-def put_text(key, text): S3.put_object(Bucket=BUCKET, Key=key, Body=text.encode()); return key
-def get_text(key): return S3.get_object(Bucket=BUCKET, Key=key)["Body"].read().decode()
+# LLM・Confluence・Slack への HTTP。接続失敗・429・5xx は指数バックオフで再試行し、エラー応答は例外にする
+http_session = requests.Session()
+retry_policy = urllib3.Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504],
+                             allowed_methods=None)  # POST も再試行する
+for scheme in ("http://", "https://"):
+    http_session.mount(scheme, requests.adapters.HTTPAdapter(max_retries=retry_policy))
+http_session.hooks["response"].append(lambda response, *args, **kwargs: response.raise_for_status())
 
-def send(queue, j, rev):  # 通知は識別情報だけ。FIFOキューの重複排除IDで二重送信を除き、同じジョブの通知は順に1件ずつ処理させる
-    SQS.send_message(QueueUrl=E(f"{queue.upper()}_QUEUE_URL"), MessageBody=dumps({"job_id": j["job_id"], "revision": rev, "event": queue}),
-                     MessageGroupId=j["job_id"], MessageDeduplicationId=f"{j['job_id']}-{j['cycle']}-{rev}")
+# プロンプトでデータを囲むタグ。外部情報に含まれるこれらのタグ記法は取り除く
+TAG_NAMES = "instruction|comment|plan|skills?|task|reference|previous|review|viewpoints|document"
+DATA_TAGS = re.compile(rf"</?\s*(?:{TAG_NAMES})\b[^>]*>", re.IGNORECASE)
 
-def call_llm(system_prompt: str, user_prompt: str) -> str:  # 独自LLMエンドポイントの薄いアダプター。本文の形式と応答の位置は設定で合わせる
-    body = re.sub(r"\{\{(system|user)\}\}", lambda m: json.dumps({"system": system_prompt, "user": user_prompt}[m[1]])[1:-1],
-                  E("LLM_REQUEST_TEMPLATE", '{"system": "{{system}}", "prompt": "{{user}}"}'))
-    res = HTTP.post(E("LLM_URL"), data=body.encode(), timeout=float(E("LLM_TIMEOUT", 120)),
-                    headers={"Content-Type": "application/json", E("LLM_API_KEY_HEADER", "Authorization"): E("LLM_API_KEY", "")})
-    if isinstance(out := jmespath.search(E("LLM_RESPONSE_PATH", "output"), res.json()), str) and out.strip(): return out
-    raise ValueError(f"LLMの応答形式が不正です: {res.text[:200]}")
+def now():
+    return datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
 
-def ask_json(system, user, schema):  # JSONモードを仮定せず、応答からJSONを抜き出して型を検証する（不正なら例外→通知ごと再試行）
-    pydantic.TypeAdapter(schema).validate_python(value := json.loads((re.search(r"[\[{].*[\]}]", call_llm(system, user), re.S) or ["null"])[0]))
+def to_json(value):
+    return json.dumps(value, ensure_ascii=False)
+
+def load_job(job_id):
+    """Redis からジョブ（フラットな JSON）を読む。"""
+    data = redis_client.get(f"job:{job_id}")
+    if data is None:
+        raise LookupError(f"job not found: {job_id}")
+    return json.loads(data)
+
+def save_job(job, **changes):
+    """ジョブの項目を更新して Redis に保存する。"""
+    job.update(changes, updated_at=now())
+    redis_client.set(f"job:{job['job_id']}", to_json(job))
+    return job
+
+def put_text(key, text):
+    s3.put_object(Bucket=BUCKET, Key=key, Body=text.encode())
+    return key
+
+def get_text(key):
+    return s3.get_object(Bucket=BUCKET, Key=key)["Body"].read().decode()
+
+def notify_queue(queue, job, revision):
+    """キューへ通知する（識別情報だけ）。FIFO の重複排除IDで二重送信を除き、同じジョブの通知は順に処理させる。"""
+    body = to_json({"job_id": job["job_id"], "revision": revision, "event": queue})
+    deduplication_id = f"{job['job_id']}-{job['cycle']}-{revision}"
+    sqs.send_message(QueueUrl=env(f"{queue.upper()}_QUEUE_URL"), MessageBody=body,
+                     MessageGroupId=job["job_id"], MessageDeduplicationId=deduplication_id)
+
+def call_llm(system_prompt: str, user_prompt: str) -> str:
+    """独自LLMエンドポイントを呼ぶ薄いアダプター。本文の形式と応答の取り出し位置は設定で接続先に合わせる。"""
+    template = env("LLM_REQUEST_TEMPLATE", '{"system": "{{system}}", "prompt": "{{user}}"}')
+    prompts = {"system": system_prompt, "user": user_prompt}
+    # {{system}} と {{user}} を、JSON 文字列としてエスケープしたプロンプトで置き換える（前後の引用符は除く）
+    body = re.sub(r"\{\{(system|user)\}\}", lambda match: json.dumps(prompts[match[1]])[1:-1], template)
+    api_key_header = env("LLM_API_KEY_HEADER", "Authorization")
+    headers = {"Content-Type": "application/json", api_key_header: env("LLM_API_KEY", "")}
+    timeout = float(env("LLM_TIMEOUT", 120))
+    response = http_session.post(env("LLM_URL"), data=body.encode(), headers=headers, timeout=timeout)
+    text = jmespath.search(env("LLM_RESPONSE_PATH", "output"), response.json())
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError(f"LLMの応答形式が不正です: {response.text[:200]}")
+    return text
+
+def ask_json(system_prompt, user_prompt, schema):
+    """JSON モードを仮定せず、応答から JSON を抜き出して型を検証する（不正なら例外にして通知ごと再試行させる）。"""
+    answer = call_llm(system_prompt, user_prompt)
+    json_part = re.search(r"[\[{].*[\]}]", answer, re.DOTALL)
+    if json_part is None:
+        raise ValueError(f"LLMの応答にJSONが含まれていません: {answer[:200]}")
+    value = json.loads(json_part[0])
+    pydantic.TypeAdapter(schema).validate_python(value)  # 定義外の項目（summary など）は残したまま検証する
     return value
 
-def tag(name, text):  # データをタグで囲み、中のタグ記法を消す（Wiki本文などが区切りを破ってシステムプロンプトを上書きしないように）
-    return f"<{name}>\n{re.sub(TAGS, '', str(text), flags=re.I)}\n</{name}>\n" if text else ""
+def tag(name, text):
+    """データをタグで囲む。中のタグ記法は取り除き、Wiki 本文などが区切りを破って指示を上書きできないようにする。"""
+    if not text:
+        return ""
+    return f"<{name}>\n{DATA_TAGS.sub('', str(text))}\n</{name}>\n"
 
-def prompts(name):  # prompts/<name>.md の「## 見出し」ごとに、共通の system と連結したシステムプロンプト
-    parts = dict(map(str.strip, s.split("\n", 1)) for s in (ROOT / "prompts" / f"{name}.md").read_text(encoding="utf-8").split("\n## ")[1:])
-    return {k: parts["system"] + "\n\n" + v for k, v in parts.items() if k != "system"}
+def load_prompts(name):
+    """prompts/<name>.md を「## 見出し」ごとに分け、共通の system と連結したシステムプロンプトを用途別に返す。"""
+    text = (APP_ROOT / "prompts" / f"{name}.md").read_text(encoding="utf-8")
+    sections = {}
+    for section in text.split("\n## ")[1:]:  # 最初の見出しより前は説明なので使わない
+        title, body = section.split("\n", 1)
+        sections[title.strip()] = body.strip()
+    system_rules = sections.pop("system")
+    return {title: f"{system_rules}\n\n{body}" for title, body in sections.items()}
 
-def skills(system, keys, task):  # SKILL.mdの名前と説明だけをLLMに示して選ばせ、選ばれたSkillの本文をプロンプト用に返す
-    found = {p["name"]: p for p in (frontmatter.loads(get_text(k)) for k in keys) if p.get("name")}
-    menu = "\n".join(f"- {n}: {p.get('description', '')}" for n, p in found.items())
-    names = ask_json(system, tag("task", task) + tag("skills", menu), list[str]) if found else []
-    return "".join(tag("skill", f"# {n}\n{found[n].content}") for n in dict.fromkeys(names) if n in found)
+def select_skills(system_prompt, skill_keys, task):
+    """Skill の名前と説明だけを LLM に示して選ばせ、選ばれた SKILL.md の本文をプロンプト用に返す。"""
+    skills = {}
+    for key in skill_keys:
+        skill = frontmatter.loads(get_text(key))
+        if skill.get("name"):  # name のない SKILL.md は使わない
+            skills[skill["name"]] = skill
+    if not skills:
+        return ""
+    menu = "\n".join(f"- {name}: {skill.get('description', '')}" for name, skill in skills.items())
+    selected_names = ask_json(system_prompt, tag("task", task) + tag("skills", menu), list[str])
+    selected = [name for name in dict.fromkeys(selected_names) if name in skills]
+    return "".join(tag("skill", f"# {name}\n{skills[name].content}") for name in selected)
 
-def slack(j, result):  # 完了・上限到達・異常終了の通知。失敗しても状態はRedisに残りWeb画面で確認できるため、ログだけ残す
-    text = f"[{result}] {j['name']}\nジョブ {j['job_id']} レビュー {j['review_count']}/{j['max_reviews']}\n{E('APP_URL', '')}/job.html?id={j['job_id']}"
-    try: E("SLACK_WEBHOOK_URL") and HTTP.post(E("SLACK_WEBHOOK_URL"), json={"text": text}, timeout=30)
-    except requests.RequestException: logging.exception("Slack通知に失敗しました")
+def notify_slack(job, result):
+    """完了・上限到達・異常終了を Slack へ通知する。失敗しても状態は Web 画面で確認できるため、ログだけ残す。"""
+    webhook_url = env("SLACK_WEBHOOK_URL")
+    if not webhook_url:
+        return
+    text = (f"[{result}] {job['name']}\n"
+            f"ジョブ {job['job_id']} レビュー {job['review_count']}/{job['max_reviews']}\n"
+            f"{env('APP_URL', '')}/job.html?id={job['job_id']}")
+    try:
+        http_session.post(webhook_url, json={"text": text}, timeout=30)
+    except requests.RequestException:
+        logging.exception("Slack通知に失敗しました: %s", job["job_id"])
 
-def handler(process):  # SQS通知のLambdaハンドラー。失敗はジョブに記録して例外を投げ、SQSの再配信に任せる（上限超過はDLQへ）
-    def run(event, context=None):
-        for msg in (json.loads(rec["body"]) for rec in event["Records"]):
-            try: process(msg)
-            except Exception as e: save(job(msg["job_id"]), error=f"{type(e).__name__}: {e}"[:500]); raise
-    return run
+def sqs_handler(process):
+    """SQS の通知を処理する Lambda ハンドラーを作る。失敗はジョブに記録して例外を投げ、SQS の再配信に任せる。"""
+    def handler(event, context=None):
+        for record in event["Records"]:
+            message = json.loads(record["body"])
+            try:
+                process(message)
+            except Exception as error:  # 再試行の上限を超えた通知は DLQ へ移り、dead_letter_handler が処理する
+                save_job(load_job(message["job_id"]), error=f"{type(error).__name__}: {error}"[:500])
+                raise
+    return handler
 
-def dead_letter(event, context=None):  # 再試行の上限を超えた通知（DLQ）: 異常終了として記録し、Slackへ通知する
-    for rec in event["Records"]:
-        j = save(job(json.loads(rec["body"])["job_id"]), status="failed")
-        slack(j, f"異常終了: {j.get('error') or 'タイムアウト等'}")
+def dead_letter_handler(event, context=None):
+    """再試行の上限を超えた通知（DLQ）を受け、ジョブを異常終了にして Slack へ通知する。"""
+    for record in event["Records"]:
+        message = json.loads(record["body"])
+        job = save_job(load_job(message["job_id"]), status="failed")
+        notify_slack(job, f"異常終了: {job.get('error') or 'タイムアウト等'}")

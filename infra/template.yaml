@@ -3,7 +3,7 @@ Transform: AWS::Serverless-2016-10-31
 Description: >-
   ドキュメント自動生成・自動レビュー。生成アプリとレビューアプリを独立したLambda（コンテナイメージ）として配置し、
   generation-queue / review-queue（SQS FIFO）の通知でだけ連携する。成果物はS3、ジョブ状態はRedisに保存する。
-  再試行の上限を超えた通知はDLQへ移り、dead_letter 関数がジョブを異常終了にしてSlackへ通知する。
+  再試行の上限を超えた通知はDLQへ移り、DeadLetterFunction（common.dead_letter_handler）がジョブを異常終了にしてSlackへ通知する。
 
 Parameters:
   GeneratorImageUri:
@@ -200,7 +200,7 @@ Resources:
       PackageType: Image
       ImageUri: !Ref ReviewerImageUri
       ImageConfig:
-        Command: ["common.dead_letter"]
+        Command: ["common.dead_letter_handler"]
       Timeout: 60
       MemorySize: 256
       Events:
@@ -241,5 +241,5 @@ Outputs:
   ReviewQueueUrl:
     Value: !Ref ReviewQueue
   DeadLetterQueues:
-    Description: 再試行の上限を超えた通知の退避先（dead_letter 関数が処理する）
+    Description: 再試行の上限を超えた通知の退避先（DeadLetterFunction が処理する）
     Value: !Join [", ", [!Ref GenerationDeadLetterQueue, !Ref ReviewDeadLetterQueue]]

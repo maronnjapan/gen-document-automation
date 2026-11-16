@@ -24,7 +24,7 @@ flowchart LR
   REV -->|結果・状態| Redis
   REV -->|指摘あり・上限未到達| GQ
   REV -->|完了・上限到達| SL[Slack Webhook]
-  GQ & RQ -.->|再試行の上限超過| DLQ[[DLQ]] -.-> DL[common.dead_letter] -.->|異常終了| SL
+  GQ & RQ -.->|再試行の上限超過| DLQ[[DLQ]] -.-> DL[common.dead_letter_handler] -.->|異常終了| SL
 ```
 
 - 生成アプリとレビューアプリは別々のコンテナイメージ・Lambda 関数です。互いを直接呼ばず、SQS の通知だけで連携します。
@@ -80,7 +80,7 @@ flowchart LR
 
 ## バックエンドの行数
 
-バックエンド（`backend/*.py`）は 5 ファイル合計で物理 181 行（空行・docstring・コメントを除くコード 139 行）です。
+バックエンド（`backend/*.py`）は 5 ファイル合計で物理 381 行（空行・docstring・コメントを除くコード 288 行）です。
 処理の多くをライブラリと AWS の標準機能に任せ、アプリには業務の流れだけを残しています。
 
 | 処理 | 任せている先 |
@@ -94,7 +94,13 @@ flowchart LR
 | Confluence 本文（HTML）の Markdown 変換 | `markdownify` |
 | 入力検証、Web API | FastAPI / pydantic |
 
-計画書の目標「100 行程度」まで減らすには、作成指示の整理（構成案・検索クエリ）、Skills の選択、エラー内容の記録などの要件を削る必要があるため、現在の行数にとどめています。
+行数よりも読みやすさを優先し、次のように書いています。
+
+- 変数・関数は略さずに名前を付ける（`job`・`revision`・`common.load_job()`・`notify_queue()` など）
+- 状態の判定などの分岐は `if` / `elif` で書き、1 行に複数の文や条件式を詰め込まない
+- 行数を抑えるため、関数の間の空行は 1 行、import はグループごとに 1 行にまとめる（`ruff format` の対象外）
+
+計画書の目標「100 行程度」まで減らすには、作成指示の整理（構成案・検索クエリ）、Skills の選択、エラー内容の記録などの要件を削るか、読みやすさを犠牲にする必要があるため、現在の行数にとどめています。
 
 ## 設定（環境変数）
 
@@ -207,14 +213,14 @@ export SAM_PARAMS='RedisUrl=rediss://... LlmUrl=https://... LlmApiKey=... Conflu
 STACK=doc-automation REGION=ap-northeast-1 ./infra/deploy.sh
 ```
 
-`deploy.sh` は 3 つのイメージをビルドして Amazon ECR に登録し、`sam deploy` を実行します（DLQ 処理の関数はレビューアプリのイメージを使い、ハンドラーだけを `common.dead_letter` に変えます）。
+`deploy.sh` は 3 つのイメージをビルドして Amazon ECR に登録し、`sam deploy` を実行します（DLQ 処理の関数はレビューアプリのイメージを使い、ハンドラーだけを `common.dead_letter_handler` に変えます）。
 Web 画面の関数 URL は既定で `AWS_IAM` 認証です（計画書で指定されていない認証機能はアプリに追加していないため、公開範囲はネットワークや関数 URL の設定で制御してください）。
 
 SQS の設定は次の前提に合わせています。
 
 - FIFO キュー。重複排除 ID は `ジョブID-レビューサイクル-リビジョン`、メッセージグループはジョブ ID
 - バッチサイズ 1。可視性タイムアウトは関数タイムアウト（900 秒）より長い 960 秒
-- 受信回数が `MaxReceiveCount`（3）を超えた通知は DLQ に移り、`common.dead_letter` がジョブを異常終了にして Slack へ通知する
+- 受信回数が `MaxReceiveCount`（3）を超えた通知は DLQ に移り、`common.dead_letter_handler` がジョブを異常終了にして Slack へ通知する
 
 ## 設計メモ
 

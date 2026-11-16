@@ -10,13 +10,18 @@ pythonpath = ["backend", "tests"]
 addopts = "-p no:cacheprovider"
 
 [tool.ruff]
-line-length = 160
+line-length = 120
 target-version = "py312"
+
+[tool.ruff.format]
+# backend は行数を抑えるため、関数の間の空行を 1 行にして手で整形している（フォーマッターの対象外）
+exclude = ["backend/*"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "B", "UP"]
-# バックエンドは行数を抑えるため、短い1行のif文・複数文・lambda代入を許容する
-ignore = ["E701", "E702", "E731", "E302", "E305", "E401", "B023", "UP013", "UP015"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["E402", "E731"]
+# backend は行数を抑えるため、関数の間の空行を 1 行にし、import をグループごとに 1 行にまとめている
+"backend/*" = ["E302", "E305", "E401"]
+# テストのハーネスは、backend のモジュールを読み込む前に環境変数を設定する
+"tests/*" = ["E402"]

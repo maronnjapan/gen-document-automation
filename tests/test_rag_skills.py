@@ -1,6 +1,7 @@
 """RAGアダプター（版管理・差し替え）とSkills（解析・LLMによる選択・本文の再投入）の検証。"""
+
 import rag
-from harness import c, drain, new_job
+from harness import common, drain, new_job
 
 SKILL_A = "---\nname: skill-a\ndescription: 手順書の書き方\n---\n# A\n手順は番号付きリストで書く"
 SKILL_B = "---\nname: skill-b\ndescription: 設計書の書き方\n---\n# B\n代替案を比較する"
@@ -13,11 +14,14 @@ def test_rag_replaces_old_version_and_excludes_stale_chunks(world):
     assert rag.get_indexed_version("p1") == "1" and rag.get_indexed_version("p2") is None
     rag.upsert_page("p1", "2", ["新版の決済API説明", "障害時の連絡先"], {"title": "決済"})
     hits = rag.search("決済APIの説明", ["p1"], 5)
-    assert rag.get_indexed_version("p1") == "2" and [h["text"] for h in hits] == ["新版の決済API説明", "障害時の連絡先"]  # 類似度順
+    assert rag.get_indexed_version("p1") == "2" and [h["text"] for h in hits] == [
+        "新版の決済API説明",
+        "障害時の連絡先",
+    ]  # 類似度順
     assert hits[0]["title"] == "決済"
 
     # RAG側に旧版のチャンクが残っていても、版が一致しないものは検索結果から除外する
-    c.R.set("rag:chunks:p1", c.dumps([{"text": "旧版", "version": "1"}]))
+    common.redis_client.set("rag:chunks:p1", common.to_json([{"text": "旧版", "version": "1"}]))
     assert rag.search("旧版", ["p1"], 5) == [] and rag.search("決済", ["p9"], 5) == []
 
 
@@ -34,17 +38,25 @@ def test_only_new_or_updated_wiki_pages_are_reindexed(world, client, monkeypatch
     drain()
     assert sorted(upserts) == [("101", "1"), ("101", "2"), ("102", "3")]  # 同じ版の102は登録し直さない
     assert "PUT /payments" in world.prompts("generate")[-1] and "POST /payments" not in world.prompts("generate")[-1]
-    assert "## v2" in c.R.get("rag:chunks:101") and "**v2**" in c.R.get("rag:chunks:101")  # storage形式(HTML)をMarkdownに変換して登録
+    assert "## v2" in common.redis_client.get("rag:chunks:101") and "**v2**" in common.redis_client.get(
+        "rag:chunks:101"
+    )  # storage形式(HTML)をMarkdownに変換して登録
 
 
 def test_rag_adapter_can_be_swapped(world, client, monkeypatch):
     store = {}  # 別実装（例: 実RAG DB）への差し替えを想定したインメモリ実装
     monkeypatch.setattr(rag, "get_indexed_version", lambda pid: store.get(pid, (None,))[0])
     monkeypatch.setattr(rag, "upsert_page", lambda pid, ver, chunks, meta: store.__setitem__(pid, (ver, chunks, meta)))
-    monkeypatch.setattr(rag, "search", lambda q, ids, k: [{**store[i][2], "text": t} for i in ids for t in store[i][1]][:k])
+    monkeypatch.setattr(
+        rag, "search", lambda q, ids, k: [{**store[i][2], "text": t} for i in ids for t in store[i][1]][:k]
+    )
     jid = new_job(client)
     drain()
-    assert c.job(jid)["status"] == "completed" and store["101"][0] == "1" and not c.R.exists("rag:chunks:101")
+    assert (
+        common.load_job(jid)["status"] == "completed"
+        and store["101"][0] == "1"
+        and not common.redis_client.exists("rag:chunks:101")
+    )
     assert "POST /payments" in world.prompts("generate")[0]
 
 
@@ -57,10 +69,12 @@ def test_long_pages_are_split_into_chunks(world, client):
 
 
 def test_wiki_search_is_skipped_without_queries(world, client):
-    world.llm_hook = lambda kind, user: '{"instruction": "x", "outline": [], "queries": ["", " \\"\\" "]}' if kind == "plan" else None
+    world.llm_hook = lambda kind, user: (
+        '{"instruction": "x", "outline": [], "queries": ["", " \\"\\" "]}' if kind == "plan" else None
+    )
     jid = new_job(client)
     drain()
-    assert c.job(jid)["status"] == "completed" and not [r for r in world.requests if "wiki.test" in r.url]
+    assert common.load_job(jid)["status"] == "completed" and not [r for r in world.requests if "wiki.test" in r.url]
     assert "<reference>" not in world.prompts("generate")[0]
 
 
@@ -68,9 +82,12 @@ def test_llm_selects_skills_and_only_selected_bodies_are_used(world, client):
     world.skill_choice = {"generation_skills": ["skill-a", "unknown", "skill-a"], "review_skills": ["security"]}
     jid = new_job(client, generation_skills=[SKILL_A, SKILL_B], review_skills=[SKILL_R])
 
-    j = c.job(jid)  # Skillsもオブジェクトストレージに保存し、ジョブには参照情報を持つ
-    assert j["generation_skills"] == [f"jobs/{jid}/skills/generation_skills/00.md", f"jobs/{jid}/skills/generation_skills/01.md"]
-    assert c.get_text(j["review_skills"][0]) == SKILL_R
+    j = common.load_job(jid)  # Skillsもオブジェクトストレージに保存し、ジョブには参照情報を持つ
+    assert j["generation_skills"] == [
+        f"jobs/{jid}/skills/generation_skills/00.md",
+        f"jobs/{jid}/skills/generation_skills/01.md",
+    ]
+    assert common.get_text(j["review_skills"][0]) == SKILL_R
     drain()
 
     menu = world.prompts("generation_skills")[0]  # まず名前と説明の一覧だけをLLMへ渡す

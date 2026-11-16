@@ -62,7 +62,7 @@ services:
 
   dead-letter:  # 再試行の上限を超えた通知（DLQ）を異常終了にする関数（レビューアプリのイメージを流用）
     build: { context: .., dockerfile: infra/Dockerfile.reviewer }
-    command: ["common.dead_letter"]
+    command: ["common.dead_letter_handler"]
     environment: *app-env
     depends_on: [redis]
 
