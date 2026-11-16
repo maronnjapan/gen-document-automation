@@ -1,0 +1,9 @@
+# 生成・レビューアプリ（Lambda）とAPIの共通依存
+boto3==1.44.3             # S3・SQS
+redis==8.1.0              # ジョブ状態
+requests==2.34.2          # LLM・Confluence・Slack への HTTP
+urllib3==2.8.0            # HTTP の再試行（指数バックオフ）
+jmespath==1.1.0           # LLM 応答から本文を取り出すパス
+pydantic==2.14.3          # LLM 出力（JSON）の型検証
+python-frontmatter==1.3.0 # SKILL.md の YAML フロントマター
+markdownify==1.2.3        # Confluence 本文（HTML）→ Markdown

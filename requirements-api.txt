@@ -1,0 +1,4 @@
+# Web API（Web UI配信を含む）の依存
+-r requirements.txt
+fastapi==0.163.1
+uvicorn==0.54.0

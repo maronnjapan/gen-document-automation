@@ -1,0 +1,12 @@
+# レビューアプリ（review-queue の保存イベントで起動するサーバーレスコンテナ）
+# 生成アプリとは独立したイメージ・関数としてデプロイする。
+FROM public.ecr.aws/lambda/python:3.13
+
+COPY requirements.txt ${LAMBDA_TASK_ROOT}/
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
+
+COPY backend/common.py backend/reviewer.py ${LAMBDA_TASK_ROOT}/
+COPY prompts/ ${LAMBDA_TASK_ROOT}/prompts/
+ENV APP_ROOT=${LAMBDA_TASK_ROOT}
+
+CMD ["reviewer.handler"]

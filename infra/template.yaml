@@ -1,0 +1,245 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  ドキュメント自動生成・自動レビュー。生成アプリとレビューアプリを独立したLambda（コンテナイメージ）として配置し、
+  generation-queue / review-queue（SQS FIFO）の通知でだけ連携する。成果物はS3、ジョブ状態はRedisに保存する。
+  再試行の上限を超えた通知はDLQへ移り、DeadLetterFunction（common.dead_letter_handler）がジョブを異常終了にしてSlackへ通知する。
+
+Parameters:
+  GeneratorImageUri:
+    Type: String
+    Description: 生成アプリのイメージ（ECR）。例 123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/doc-automation-generator:abc123
+  ReviewerImageUri:
+    Type: String
+    Description: レビューアプリのイメージ（ECR）
+  ApiImageUri:
+    Type: String
+    Description: Web UI / Web API のイメージ（ECR）
+  RedisUrl:
+    Type: String
+    NoEcho: true
+    Description: Redis接続URL（例 rediss://xxx.cache.amazonaws.com:6379/0）。Redisの構築・永続化設計は本テンプレートの対象外
+  LlmUrl:
+    Type: String
+    Description: 独自LLMエンドポイントのURL
+  LlmApiKey:
+    Type: String
+    NoEcho: true
+    Description: APIキーを付けるヘッダーの値（例 "Bearer xxx"。形式は接続先の仕様に合わせる）
+  LlmApiKeyHeader:
+    Type: String
+    Default: Authorization
+  LlmRequestTemplate:
+    Type: String
+    Default: '{"system": "{{system}}", "prompt": "{{user}}"}'
+    Description: リクエスト本文のテンプレート。{{system}} と {{user}} がJSON文字列として埋め込まれる
+  LlmResponsePath:
+    Type: String
+    Default: output
+    Description: 応答JSONから本文を取り出す JMESPath（例 choices[0].message.content）
+  LlmTimeout:
+    Type: Number
+    Default: 120
+  ConfluenceUrl:
+    Type: String
+    Description: 例 https://example.atlassian.net/wiki
+  ConfluenceAuth:
+    Type: String
+    NoEcho: true
+    Description: Authorizationヘッダーの値。APIトークンの形式は接続先に合わせる（例 "Bearer <PAT>"、Cloud なら "Basic <base64(email:token)>"）
+  ConfluenceCql:
+    Type: String
+    Default: type=page
+    Description: 検索対象を絞り込むCQL（例 type=page AND space = DEV）
+  SlackWebhookUrl:
+    Type: String
+    NoEcho: true
+    Default: ""
+  AppUrl:
+    Type: String
+    Default: ""
+    Description: Slack通知に載せるWeb画面のURL（未指定ならデプロイ後に関数URLを設定する）
+  MaxReceiveCount:
+    Type: Number
+    Default: 3
+    Description: 1件の通知を処理する最大試行回数。超えた通知はDLQへ移り、異常終了としてSlackへ通知する
+  SubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: RedisがVPC内にある場合に指定（外部APIへ出るためNAT経由の経路が必要）
+  SecurityGroupIds:
+    Type: CommaDelimitedList
+    Default: ""
+  ApiAuthType:
+    Type: String
+    AllowedValues: [AWS_IAM, NONE]
+    Default: AWS_IAM
+    Description: Web画面の関数URLの認証方式。NONE にする場合は社内ネットワーク等で保護すること
+
+Conditions:
+  HasVpc: !Not [!Equals [!Join ["", !Ref SubnetIds], ""]]
+
+Globals:
+  Function:
+    Architectures: [x86_64]
+    Timeout: 900
+    MemorySize: 1024
+    VpcConfig: !If
+      - HasVpc
+      - SubnetIds: !Ref SubnetIds
+        SecurityGroupIds: !Ref SecurityGroupIds
+      - !Ref AWS::NoValue
+    Environment:
+      Variables:
+        REDIS_URL: !Ref RedisUrl
+        S3_BUCKET: !Ref DocumentBucket
+        GENERATION_QUEUE_URL: !Ref GenerationQueue
+        REVIEW_QUEUE_URL: !Ref ReviewQueue
+        LLM_URL: !Ref LlmUrl
+        LLM_API_KEY: !Ref LlmApiKey
+        LLM_API_KEY_HEADER: !Ref LlmApiKeyHeader
+        LLM_REQUEST_TEMPLATE: !Ref LlmRequestTemplate
+        LLM_RESPONSE_PATH: !Ref LlmResponsePath
+        LLM_TIMEOUT: !Ref LlmTimeout
+        CONFLUENCE_URL: !Ref ConfluenceUrl
+        CONFLUENCE_AUTH: !Ref ConfluenceAuth
+        CONFLUENCE_CQL: !Ref ConfluenceCql
+        SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
+        APP_URL: !Ref AppUrl
+        AWS_RETRY_MODE: standard  # boto3(S3/SQS)の再試行
+        AWS_MAX_ATTEMPTS: "5"
+
+Resources:
+  DocumentBucket:  # Markdown（jobs/<id>/drafts/NNN.md, final/final.md）とSkills
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # FIFOキュー: 重複排除ID（ジョブID-サイクル-リビジョン）で二重送信を除き、同じジョブの通知はメッセージグループで1件ずつ順に処理する
+  GenerationDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-generation-dlq.fifo
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600
+
+  GenerationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-generation-queue.fifo
+      FifoQueue: true
+      VisibilityTimeout: 960  # 関数タイムアウト(900秒)より長くし、処理中の再配信を防ぐ
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt GenerationDeadLetterQueue.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+
+  ReviewDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-review-dlq.fifo
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600
+
+  ReviewQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-review-queue.fifo
+      FifoQueue: true
+      VisibilityTimeout: 960
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ReviewDeadLetterQueue.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+
+  GeneratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      ImageUri: !Ref GeneratorImageUri
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref DocumentBucket
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ReviewQueue.QueueName
+      Events:
+        Generation:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt GenerationQueue.Arn
+            BatchSize: 1
+
+  ReviewerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      ImageUri: !Ref ReviewerImageUri
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref DocumentBucket
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt GenerationQueue.QueueName
+      Events:
+        Review:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ReviewQueue.Arn
+            BatchSize: 1
+
+  DeadLetterFunction:  # 再試行の上限を超えた通知（例外・タイムアウト）→ ジョブを異常終了にしてSlackへ通知
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      ImageUri: !Ref ReviewerImageUri
+      ImageConfig:
+        Command: ["common.dead_letter_handler"]
+      Timeout: 60
+      MemorySize: 256
+      Events:
+        GenerationFailed:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt GenerationDeadLetterQueue.Arn
+            BatchSize: 1
+        ReviewFailed:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ReviewDeadLetterQueue.Arn
+            BatchSize: 1
+
+  ApiFunction:  # Lambda Web Adapter で uvicorn をそのまま動かす
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      ImageUri: !Ref ApiImageUri
+      Timeout: 30
+      MemorySize: 512
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref DocumentBucket
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt GenerationQueue.QueueName
+      FunctionUrlConfig:
+        AuthType: !Ref ApiAuthType
+
+Outputs:
+  WebUrl:
+    Description: Web画面（関数URL）
+    Value: !GetAtt ApiFunctionUrl.FunctionUrl
+  DocumentBucketName:
+    Value: !Ref DocumentBucket
+  GenerationQueueUrl:
+    Value: !Ref GenerationQueue
+  ReviewQueueUrl:
+    Value: !Ref ReviewQueue
+  DeadLetterQueues:
+    Description: 再試行の上限を超えた通知の退避先（DeadLetterFunction が処理する）
+    Value: !Join [", ", [!Ref GenerationDeadLetterQueue, !Ref ReviewDeadLetterQueue]]

@@ -1,0 +1,27 @@
+[project]
+name = "gen-document-automation"
+version = "0.1.0"
+description = "Confluence Wiki と RAG を使った Markdown ドキュメントの自動生成・自動レビュー"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["backend", "tests"]
+addopts = "-p no:cacheprovider"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.format]
+# backend は行数を抑えるため、関数の間の空行を 1 行にして手で整形している（フォーマッターの対象外）
+exclude = ["backend/*"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# backend は行数を抑えるため、関数の間の空行を 1 行にし、import をグループごとに 1 行にまとめている
+"backend/*" = ["E302", "E305", "E401"]
+# テストのハーネスは、backend のモジュールを読み込む前に環境変数を設定する
+"tests/*" = ["E402"]
