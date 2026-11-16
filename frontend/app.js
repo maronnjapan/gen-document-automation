@@ -62,6 +62,27 @@ function showMessage(target, text, isError = false) {
   target.classList.toggle('error', isError);
 }
 
+// このブラウザで作成・表示したジョブのID（ジョブ一覧はサーバーに持たず、ブラウザに記録する）
+const JOBS_KEY = 'doc-automation:jobs';
+
+function rememberedJobs() {
+  try {
+    return JSON.parse(localStorage.getItem(JOBS_KEY)) || [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function saveRememberedJobs(ids) {
+  try {
+    localStorage.setItem(JOBS_KEY, JSON.stringify(ids.slice(0, 50)));
+  } catch (_) { /* 保存できなくても画面の動作は続ける */ }
+}
+
+function rememberJob(id) {
+  saveRememberedJobs([id, ...rememberedJobs().filter(x => x !== id)]);
+}
+
 // SKILL.md のYAMLフロントマターから name と description を取り出す（表示・事前チェック用）
 function frontMatter(text) {
   const m = /^\s*---[ \t]*\n([\s\S]*?)\n---[ \t]*(\n|$)/.exec(text);
@@ -241,6 +262,10 @@ async function initNewJobPage() {
     showMessage(message, '送信中…');
     try {
       const job = await api('/api/jobs', { method: 'POST', body });
+      rememberJob(job.job_id);
+      try {
+        await api(`/api/jobs/${encodeURIComponent(job.job_id)}/enqueue`, { method: 'POST' });  // 生成用キューへ通知
+      } catch (_) { /* 通知に失敗したジョブは、ジョブ詳細画面から生成依頼を再送できる */ }
       location.href = `job.html?id=${encodeURIComponent(job.job_id)}`;
     } catch (e) {
       showMessage(message, `実行できませんでした: ${e.message}`, true);
@@ -251,7 +276,10 @@ async function initNewJobPage() {
   async function loadJobs() {
     const tbody = document.querySelector('#jobs tbody');
     try {
-      const jobs = await api('/api/jobs');
+      const ids = rememberedJobs();
+      const results = await Promise.all(ids.map(id => api(`/api/jobs/${encodeURIComponent(id)}`).catch(e => (e.message.startsWith('404') ? null : undefined))));
+      saveRememberedJobs(ids.filter((_, i) => results[i] !== null));  // 削除されたジョブは一覧から外す
+      const jobs = results.filter(Boolean);
       tbody.replaceChildren(...(jobs.length ? jobs.map(job => el('tr', {},
         el('td', {}, el('a', { href: `job.html?id=${encodeURIComponent(job.job_id)}` }, job.name || job.job_id)),
         el('td', {}, job.doc_type || '-'),
@@ -259,7 +287,7 @@ async function initNewJobPage() {
         el('td', {}, job.revision ? `第${job.revision}版` : '-'),
         el('td', {}, `${job.review_count}/${job.max_reviews}`),
         el('td', {}, formatDate(job.updated_at)),
-      )) : [el('tr', {}, el('td', { colspan: 6, class: 'empty' }, 'まだジョブはありません'))]));
+      )) : [el('tr', {}, el('td', { colspan: 6, class: 'empty' }, 'このブラウザで作成・表示したジョブはまだありません'))]));
     } catch (e) {
       tbody.replaceChildren(el('tr', {}, el('td', { colspan: 6, class: 'error' }, `一覧を取得できませんでした: ${e.message}`)));
     }
@@ -278,6 +306,7 @@ async function initJobPage() {
     showMessage(message, 'ジョブIDが指定されていません', true);
     return;
   }
+  rememberJob(id);
   let job = null;
   let shown = { revision: null, text: '' };
   let followLatest = true;
@@ -303,7 +332,7 @@ async function initJobPage() {
     $('#meta').replaceChildren(...rows.flatMap(([k, v]) => [el('dt', {}, k), el('dd', {}, v)]));
     $('#instruction').textContent = job.instruction;
     $('#viewpoints').textContent = job.viewpoints || '（指定なし）';
-    $('#pending').hidden = !job.pending_notifications;
+    $('#pending').hidden = job.status !== 'queued';
     $('#resend').disabled = false;
   }
 
@@ -382,7 +411,7 @@ async function initJobPage() {
     updateButtons();
     if (followLatest && job.revision && shown.revision !== job.revision) await showRevision(job.revision);
     if (!job.revision) renderDocument();
-    if (RUNNING.includes(job.status) || job.pending_notifications) timer = setTimeout(refresh, 3000);
+    if (RUNNING.includes(job.status)) timer = setTimeout(refresh, 3000);
   }
 
   async function act(button, path, body, done) {
@@ -423,7 +452,7 @@ async function initJobPage() {
     if (!confirm(`第${job.revision}版を承認して確定版にしますか？`)) return;
     await act(event.target, `/api/jobs/${encodeURIComponent(id)}/approve`, undefined, '承認しました。最新版を確定版として保存しました。');
   });
-  $('#resend').addEventListener('click', event => act(event.target, `/api/jobs/${encodeURIComponent(id)}/resend`, undefined, '通知を再送しました。'));
+  $('#resend').addEventListener('click', event => act(event.target, `/api/jobs/${encodeURIComponent(id)}/enqueue`, undefined, '生成依頼を送信しました。'));
 
   await refresh();
 }

@@ -1,56 +1,77 @@
-"""独自LLMエンドポイント接続（リクエスト/レスポンス形式の吸収）とプロンプト保護の検証。"""
+"""独自LLMエンドポイント接続（リクエスト/レスポンス形式の吸収）・HTTPの再試行設定・LLM出力の検証・プロンプト保護の検証。"""
 import json
+import typing
 
+import pydantic
 import pytest
 import requests
 from harness import c, response
 
 
-def capture(monkeypatch, data):
-    sent = []
-    monkeypatch.setattr(requests, "request", lambda method, url, **kw: sent.append((method, url, kw)) or response(200, data, url))
-    return sent
+class Endpoint(requests.adapters.BaseAdapter):
+    def __init__(self, data, status=200):
+        super().__init__()
+        self.data, self.status, self.sent = data, status, []
+
+    def send(self, request, **kwargs):
+        self.sent.append((request, kwargs))
+        return response(request, self.status, self.data)
+
+    def close(self):
+        pass
+
+
+def endpoint(monkeypatch, data, status=200):
+    ep = Endpoint(data, status)
+    monkeypatch.setitem(c.HTTP.adapters, "http://", ep)
+    return ep
 
 
 def test_call_llm_default_format(monkeypatch):
     monkeypatch.setenv("LLM_REQUEST_TEMPLATE", "")  # 空の設定は未設定として既定値を使う
-    sent = capture(monkeypatch, {"output": "こんにちは"})
+    ep = endpoint(monkeypatch, {"output": "こんにちは"})
     assert c.call_llm('システム "引用" と\n改行', "ユーザー") == "こんにちは"
-    method, url, kw = sent[0]
-    assert (method, url) == ("POST", "http://llm.test/v1/generate") and kw["headers"]["Authorization"] == "Bearer llm-secret"
-    assert json.loads(kw["data"]) == {"system": 'システム "引用" と\n改行', "prompt": "ユーザー"}
-    assert kw["timeout"] == 120
+    request, kwargs = ep.sent[0]
+    assert (request.method, request.url) == ("POST", "http://llm.test/v1/generate") and request.headers["Authorization"] == "Bearer llm-secret"
+    assert json.loads(request.body) == {"system": 'システム "引用" と\n改行', "prompt": "ユーザー"} and kwargs["timeout"] == 120
 
 
 def test_call_llm_custom_format(monkeypatch):
     monkeypatch.setenv("LLM_REQUEST_TEMPLATE", '{"messages": [{"role": "system", "content": "{{system}}"}, {"role": "user", "content": "{{user}}"}]}')
-    monkeypatch.setenv("LLM_RESPONSE_PATH", "choices.0.message.content")
+    monkeypatch.setenv("LLM_RESPONSE_PATH", "choices[0].message.content")
     monkeypatch.setenv("LLM_API_KEY_HEADER", "x-api-key")
-    monkeypatch.setenv("LLM_API_KEY_FORMAT", "{}")
-    sent = capture(monkeypatch, {"choices": [{"message": {"content": "OK"}}]})
+    monkeypatch.setenv("LLM_API_KEY", "raw-key")
+    ep = endpoint(monkeypatch, {"choices": [{"message": {"content": "OK"}}]})
     assert c.call_llm("{{user}} を含む指示", "質問") == "OK"
-    body = json.loads(sent[0][2]["data"])
+    body = json.loads(ep.sent[0][0].body)
     assert body["messages"][0]["content"] == "{{user}} を含む指示" and body["messages"][1]["content"] == "質問"
-    assert sent[0][2]["headers"]["x-api-key"] == "llm-secret"
-
-
-def test_call_llm_plain_text_response(monkeypatch):
-    monkeypatch.setenv("LLM_RESPONSE_PATH", ".")
-    capture(monkeypatch, "テキストの応答")
-    assert c.call_llm("s", "u") == "テキストの応答"
+    assert ep.sent[0][0].headers["x-api-key"] == "raw-key"
 
 
 @pytest.mark.parametrize("data", [{"result": "x"}, {"output": ""}, {"output": {"text": "x"}}])
 def test_call_llm_rejects_unexpected_response(monkeypatch, data):
-    capture(monkeypatch, data)
+    endpoint(monkeypatch, data)
     with pytest.raises(ValueError, match="LLMの応答形式が不正です"):
         c.call_llm("s", "u")
 
 
-def test_http_retries_server_errors(monkeypatch):
-    codes = iter([500, 502, 200])
-    monkeypatch.setattr(requests, "request", lambda method, url, **kw: response(next(codes), {"output": "ok"}, url))
-    assert c.call_llm("s", "u") == "ok"
+def test_http_retries_transient_errors_and_raises_error_responses(monkeypatch):
+    retry = c.HTTP.get_adapter("https://example.com").max_retries  # 接続失敗・429・5xx は urllib3 が指数バックオフで再試行する
+    assert (retry.total, retry.allowed_methods, set(retry.status_forcelist)) == (3, None, {429, 500, 502, 503, 504}) and retry.backoff_factor == 1
+    endpoint(monkeypatch, {"message": "bad request"}, status=400)
+    with pytest.raises(requests.HTTPError):
+        c.HTTP.post("http://llm.test/v1/generate", json={})
+
+
+def test_ask_json_extracts_and_validates(monkeypatch):
+    schema = typing.TypedDict("S", {"issues": list[typing.TypedDict("I", {"comment": str})]})
+    endpoint(monkeypatch, {"output": '結果です。\n```json\n{"summary": "s", "issues": [{"comment": "c", "severity": "high"}]}\n```'})
+    assert c.ask_json("s", "u", schema) == {"summary": "s", "issues": [{"comment": "c", "severity": "high"}]}  # 定義外の項目も残す
+    for bad in ('{"issues": "なし"}', '{"issues": [{"severity": "high"}]}', "JSONではない応答"):
+        endpoint(monkeypatch, {"output": bad})
+        with pytest.raises(ValueError):  # pydantic.ValidationError / json.JSONDecodeError
+            c.ask_json("s", "u", schema)
+    assert issubclass(pydantic.ValidationError, ValueError)
 
 
 def test_external_text_cannot_break_out_of_its_tag():
@@ -61,9 +82,8 @@ def test_external_text_cannot_break_out_of_its_tag():
     assert c.tag("comment", "") == "" and c.tag("comment", None) == ""
 
 
-def test_parse_skill():
-    meta, body = c.parse_skill("---\nname: x\ndescription: y\n---\n# 本文\n")
-    assert meta == {"name": "x", "description": "y"} and body == "# 本文"
-    for bad in ("本文だけ", "---\ndescription: y\n---\n本文", "---\n- a\n---\n"):
-        with pytest.raises(ValueError):
-            c.parse_skill(bad)
+def test_prompts_are_split_by_section():
+    import generator
+    import reviewer
+    assert sorted(generator.P) == ["generate", "plan", "revise", "skills"] and sorted(reviewer.P) == ["review", "skills"]
+    assert all(p.startswith("あなたは社内向け") and "<reference>" in p for p in generator.P.values())  # 共通のsystemを先頭に連結

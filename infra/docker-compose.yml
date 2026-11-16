@@ -14,18 +14,16 @@ x-app-env: &app-env
   AWS_ENDPOINT_URL_SQS: http://moto:5000
   S3_BUCKET: doc-automation
   REDIS_URL: redis://redis:6379/0
-  GENERATION_QUEUE_URL: http://moto:5000/123456789012/generation-queue
-  REVIEW_QUEUE_URL: http://moto:5000/123456789012/review-queue
+  GENERATION_QUEUE_URL: http://moto:5000/123456789012/generation-queue.fifo
+  REVIEW_QUEUE_URL: http://moto:5000/123456789012/review-queue.fifo
   LLM_URL: ${LLM_URL:-http://mock:8090/llm}
-  LLM_API_KEY: ${LLM_API_KEY:-local-dummy-key}
+  LLM_API_KEY: ${LLM_API_KEY:-Bearer local-dummy-key}
   LLM_API_KEY_HEADER: ${LLM_API_KEY_HEADER:-}
-  LLM_API_KEY_FORMAT: ${LLM_API_KEY_FORMAT:-}
   LLM_REQUEST_TEMPLATE: ${LLM_REQUEST_TEMPLATE:-}
   LLM_RESPONSE_PATH: ${LLM_RESPONSE_PATH:-}
   LLM_TIMEOUT: ${LLM_TIMEOUT:-}
   CONFLUENCE_URL: ${CONFLUENCE_URL:-http://mock:8090/wiki}
-  CONFLUENCE_TOKEN: ${CONFLUENCE_TOKEN:-local-dummy-token}
-  CONFLUENCE_AUTH_FORMAT: ${CONFLUENCE_AUTH_FORMAT:-}
+  CONFLUENCE_AUTH: ${CONFLUENCE_AUTH:-Bearer local-dummy-token}
   CONFLUENCE_CQL: ${CONFLUENCE_CQL:-}
   SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-http://mock:8090/slack}
   APP_URL: ${APP_URL:-http://localhost:8000}
@@ -62,6 +60,12 @@ services:
     environment: *app-env
     depends_on: [redis, moto]
 
+  dead-letter:  # 再試行の上限を超えた通知（DLQ）を異常終了にする関数（レビューアプリのイメージを流用）
+    build: { context: .., dockerfile: infra/Dockerfile.reviewer }
+    command: ["common.dead_letter"]
+    environment: *app-env
+    depends_on: [redis]
+
   poller:  # 本番の Lambda イベントソースマッピングの代わり
     build: { context: .., dockerfile: infra/Dockerfile.api }
     command: ["python", "infra/local/poller.py"]
@@ -70,4 +74,5 @@ services:
       <<: *app-env
       GENERATION_TARGET: http://generator:8080/2015-03-31/functions/function/invocations
       REVIEW_TARGET: http://reviewer:8080/2015-03-31/functions/function/invocations
-    depends_on: [moto, generator, reviewer]
+      DEAD_LETTER_TARGET: http://dead-letter:8080/2015-03-31/functions/function/invocations
+    depends_on: [moto, generator, reviewer, dead-letter]

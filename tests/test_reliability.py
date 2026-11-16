@@ -1,73 +1,60 @@
-"""通知の重複・通知送信失敗・LLM異常・タイムアウト時の挙動の検証。"""
+"""通知の重複・通知送信の失敗・LLM異常・外部サービス異常・タイムアウト時の挙動の検証。"""
 import json
-import time
 
 import pytest
-import requests
-from harness import ISSUE, Context, c, deliver, drain, new_job, receive
+from harness import ISSUE, MAX_RECEIVES, c, deliver, drain, new_job, queue_url, receive
 
 
 def fail(exc):
     raise exc
 
 
-def test_duplicate_notifications_are_processed_once(world, client):
+def test_duplicate_send_is_deduplicated_by_fifo(world, client):
+    jid = new_job(client)
+    client.post(f"/api/jobs/{jid}/enqueue")  # 同じ通知をもう一度送る（再送ボタンの二度押しなど）
+    drain()
+    assert c.job(jid)["status"] == "completed" and world.kinds().count("generate") == 1 and world.kinds().count("review") == 1
+
+
+def test_redelivered_notification_is_not_processed_twice(world, client):
     world.reviews = [[ISSUE]]
     jid = new_job(client)
-    body = receive("generation")[0]["Body"]
-    for _ in range(2):  # 同じ生成通知が重複して届く
-        c.SQS.send_message(QueueUrl=c.QUEUES["generation"], MessageBody=body)
     drain()
-    j = c.job(jid)
+    j, calls = c.job(jid), len(world.calls)
     assert (j["status"], j["revision"], j["review_count"]) == ("completed", 2, 2)
-    assert world.kinds().count("generate") == 1 and world.kinds().count("revise") == 1 and world.kinds().count("review") == 2
 
-    # 完了後に古い保存イベント・生成通知が再配信されても状態は変わらない
-    for queue, rev in (("review", 1), ("review", 2), ("generation", 2)):
-        c.SQS.send_message(QueueUrl=c.QUEUES[queue], MessageBody=json.dumps({"job_id": jid, "revision": rev, "event": "x"}))
+    # 重複排除の期間を過ぎてから、処理済みの通知が再配信された場合
+    for queue, rev in (("generation", 1), ("generation", 2), ("review", 1), ("review", 2)):
+        c.SQS.send_message(QueueUrl=queue_url(queue), MessageBody=json.dumps({"job_id": jid, "revision": rev, "event": queue}),
+                           MessageGroupId=jid, MessageDeduplicationId=f"late-{queue}-{rev}")
     drain()
-    assert c.job(jid) == j and world.kinds().count("review") == 2 and len(world.slack) == 1
+    assert c.job(jid) == j and len(world.calls) == calls and len(world.slack) == 1  # LLM呼び出し・通知・状態はそのまま
 
 
-def test_concurrent_duplicate_is_retried_later(world, client):
+def test_queue_send_failure_is_retried(world, client, monkeypatch):
     jid = new_job(client)
-    c.R.set(f"lock:generation:{jid}:1", 1)  # 同じ通知を別の実行が処理中
-    m = receive("generation")[0]
-    assert deliver("generation", m) is False and world.calls == []  # 処理せず、後で再確認させる
-    c.R.delete(f"lock:generation:{jid}:1")
-    drain()
+    send, failures = c.SQS.send_message, iter([True])
+    flaky = lambda **kw: fail(ConnectionError("SQS unavailable")) if "review" in kw["QueueUrl"] and next(failures, False) else send(**kw)  # noqa: E731
+    monkeypatch.setattr(c.SQS, "send_message", flaky)
+    assert deliver("generation", receive("generation")[0]) is False  # 生成・Redis保存は完了し、通知だけ失敗 → 再配信させる
+    assert (c.job(jid)["revision"], c.job(jid)["status"], c.job(jid)["error"]) == (1, "reviewing", "ConnectionError: SQS unavailable")
+    drain()  # 再配信された通知では生成し直さず、保存イベントの送信だけをやり直す
     assert c.job(jid)["status"] == "completed" and world.kinds().count("generate") == 1
 
 
-def test_queue_send_failure_is_retried_from_outbox(world, client, monkeypatch):
-    jid = new_job(client)
-    send, failures = c.SQS.send_message, iter([True])
-
-    def flaky_send(**kw):  # Redis保存後の通知送信が1回だけ失敗する
-        if "review" in kw["QueueUrl"] and next(failures, False):
-            raise ConnectionError("SQS unavailable")
-        return send(**kw)
-
-    monkeypatch.setattr(c.SQS, "send_message", flaky_send)
-    assert deliver("generation", receive("generation")[0]) is False  # 生成・保存は完了、通知だけ失敗 → 再試行
-    j = c.job(jid)
-    assert (j["revision"], j["status"]) == (1, "reviewing") and c.R.hlen(f"outbox:{jid}") == 1
-    drain()  # 再配信された生成通知で未送信の通知を送り直す（LLMで再生成はしない）
-    assert c.job(jid)["status"] == "completed" and world.kinds().count("generate") == 1 and c.R.hlen(f"outbox:{jid}") == 0
-
-
-def test_api_notification_failure_can_be_resent(world, client, monkeypatch):
+def test_api_send_failure_can_be_resent(world, client, monkeypatch):
+    jid = client.post("/api/jobs", json={"name": "doc", "instruction": "x"}).json()["job_id"]  # Redisへ保存
     send = c.SQS.send_message
     monkeypatch.setattr(c.SQS, "send_message", lambda **kw: fail(ConnectionError("SQS unavailable")))
     with pytest.raises(ConnectionError):
-        client.post("/api/jobs", json={"name": "doc", "instruction": "x"})
-    jid = client.get("/api/jobs").json()[0]["job_id"]
-    assert client.get(f"/api/jobs/{jid}").json()["pending_notifications"] == 1  # ジョブは保存済み、通知は未送信
+        client.post(f"/api/jobs/{jid}/enqueue")
+    assert c.job(jid)["status"] == "queued" and receive("generation") == []  # ジョブは保存済み、通知は未送信
 
     monkeypatch.setattr(c.SQS, "send_message", send)
-    assert client.post(f"/api/jobs/{jid}/resend").json()["pending_notifications"] == 0
+    assert client.post(f"/api/jobs/{jid}/enqueue").status_code == 200  # Web画面の「生成依頼を再送」
     drain()
     assert c.job(jid)["status"] == "completed"
+    assert client.post(f"/api/jobs/{jid}/enqueue").json()["status"] == "completed" and receive("generation") == []  # 待機中以外は何もしない
 
 
 def test_invalid_llm_output_is_retried_and_then_reported(world, client):
@@ -75,69 +62,48 @@ def test_invalid_llm_output_is_retried_and_then_reported(world, client):
     jid = new_job(client)
     drain()
     j = c.job(jid)
-    # レビュー不能は正常完了扱いにしない: 再依頼(3回)×再試行(3回)の後、異常終了として通知
-    assert j["status"] == "failed" and "ValueError" in j["error"] and "review" in j["error"]
-    assert world.kinds().count("review") == c.TRIES * c.ATTEMPTS
-    assert "指定形式のJSONだけを出力してください" in world.prompts("review")[1]
-    assert len(world.slack) == 1 and "*[異常終了]*" in world.slack[0] and "エラー: review: ValueError" in world.slack[0]
+    # レビュー不能は正常完了扱いにしない: 受信回数の上限まで再試行した後、DLQ経由で異常終了として通知
+    assert j["status"] == "failed" and j["error"].startswith("ValidationError") and world.kinds().count("review") == MAX_RECEIVES
+    assert len(world.slack) == 1 and "異常終了: ValidationError" in world.slack[0] and jid in world.slack[0]
 
 
 def test_invalid_llm_output_recovers_on_retry(world, client):
-    outputs = iter(["```json\n{\"issues\": \"なし\"}\n```"])  # 1回目は形式不正、2回目以降は正常
+    outputs = iter(['```json\n{"issues": "なし"}\n```'])  # 1回目は形式不正、2回目以降は正常
     world.llm_hook = lambda kind, user: next(outputs, None) if kind == "review" else None
     jid = new_job(client)
     drain()
     assert c.job(jid)["status"] == "completed" and world.kinds().count("review") == 2
 
 
-def test_llm_connection_failure_is_retried_and_then_reported(world, client):
-    def down(kind, user):
-        raise requests.ConnectionError("LLM endpoint unreachable")
-
-    world.llm_hook = down
+def test_llm_failure_is_reported_and_human_can_restart(world, client):
+    world.status = {"llm.test": 503}  # LLMエンドポイントの障害（HTTPの再試行を使い切った状態）
     jid = new_job(client)
     drain()
     j = c.job(jid)
-    assert j["status"] == "failed" and "ConnectionError" in j["error"] and "generation" in j["error"]
-    assert len(world.calls) == c.TRIES * c.ATTEMPTS and "異常終了" in world.slack[0]
+    assert j["status"] == "failed" and j["error"].startswith("HTTPError: 503") and "異常終了" in world.slack[0]
 
-    world.llm_hook = None  # 復旧後、人間の再修正指示で再開できる
+    world.status = {}  # 復旧後、人間の修正指示で再開できる
     assert client.post(f"/api/jobs/{jid}/revise", json={"comment": "再実行"}).status_code == 200
     drain()
     assert c.job(jid)["status"] == "completed" and c.job(jid)["error"] is None
 
 
-def test_confluence_error_is_reported(world, client, monkeypatch):
-    request = world.request
-
-    def broken(method, url, **kw):
-        return request(method, url, **kw) if "wiki.test" not in url else _error(url)
-
-    def _error(url):
-        res = requests.Response()
-        res.status_code, res.url, res.reason, res._content = 503, url, "Service Unavailable", b"{}"
-        return res
-
-    monkeypatch.setattr(requests, "request", broken)
+def test_confluence_error_is_reported(world, client):
+    world.status = {"wiki.test": 401}
     jid = new_job(client)
     drain()
-    assert c.job(jid)["status"] == "failed" and "HTTPError" in c.job(jid)["error"] and "異常終了" in world.slack[0]
+    assert c.job(jid)["status"] == "failed" and "401" in c.job(jid)["error"] and "異常終了" in world.slack[0]
 
 
-def test_processing_timeout_is_reported(world, client):
-    world.llm_hook = lambda kind, user: time.sleep(3)
+def test_timeout_is_reported_from_dead_letter_queue(world, client):
     jid = new_job(client)
-    m = receive("generation")[0]
-    m["Attributes"]["ApproximateReceiveCount"] = str(c.ATTEMPTS)  # 最後の試行
-    deliver("generation", m, Context(21))  # 残り21秒 → 1秒後に打ち切る
-    j = c.job(jid)
-    assert j["status"] == "failed" and "Deadline" in j["error"] and not c.R.exists(f"lock:generation:{jid}:1")
-    assert "異常終了" in world.slack[0]
+    m = receive("generation")[0]  # Lambdaがタイムアウトで止まり、通知が削除されないまま上限を超えた場合
+    c.dead_letter({"Records": [{"messageId": m["MessageId"], "body": m["Body"]}]})
+    assert c.job(jid)["status"] == "failed" and "異常終了: タイムアウト等" in world.slack[0]
 
 
-def test_slack_failure_does_not_break_job(world, client, monkeypatch):
-    request = world.request
-    monkeypatch.setattr(requests, "request", lambda m, url, **kw: fail(requests.ConnectionError()) if "slack" in url else request(m, url, **kw))
+def test_slack_failure_does_not_break_job(world, client):
+    world.status = {"slack.test": 500}
     jid = new_job(client)
     drain()
     assert c.job(jid)["status"] == "completed"
