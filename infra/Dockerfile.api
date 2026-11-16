@@ -1,0 +1,16 @@
+# Web UI + Web API
+# Lambda Web Adapter を同梱しているため、同じイメージを Lambda（関数URL等）でも、通常のコンテナとしても実行できる。
+FROM python:3.13-slim
+COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:0.8.4 /lambda-adapter /opt/extensions/lambda-adapter
+
+WORKDIR /app
+COPY requirements.txt requirements-api.txt ./
+RUN pip install --no-cache-dir -r requirements-api.txt
+
+COPY backend/common.py backend/api.py backend/
+COPY frontend/ frontend/
+COPY skills/ skills/
+ENV APP_ROOT=/app PORT=8080 PYTHONUNBUFFERED=1
+EXPOSE 8080
+
+CMD ["sh", "-c", "exec uvicorn --app-dir backend api:app --host 0.0.0.0 --port ${PORT}"]

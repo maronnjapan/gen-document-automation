@@ -1,0 +1,12 @@
+# 生成アプリ（generation-queue の通知で起動するサーバーレスコンテナ）
+# ECR に登録し、AWS Lambda（コンテナイメージ）で実行する。ベースイメージに Runtime Interface Emulator が含まれるため、ローカルでも同じイメージを動かせる。
+FROM public.ecr.aws/lambda/python:3.13
+
+COPY requirements.txt ${LAMBDA_TASK_ROOT}/
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
+
+COPY backend/common.py backend/rag.py backend/generator.py ${LAMBDA_TASK_ROOT}/
+COPY prompts/ ${LAMBDA_TASK_ROOT}/prompts/
+ENV APP_ROOT=${LAMBDA_TASK_ROOT}
+
+CMD ["generator.handler"]

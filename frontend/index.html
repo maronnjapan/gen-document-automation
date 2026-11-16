@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>新規生成 - ドキュメント自動生成</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header><a href="./">ドキュメント自動生成・自動レビュー</a></header>
+  <main>
+    <section class="card">
+      <h1>新規生成</h1>
+      <form id="new-job">
+        <div class="grid2">
+          <label>ドキュメント名
+            <input name="name" required maxlength="200" placeholder="例: 決済API 利用手順書">
+          </label>
+          <label>種類
+            <input name="doc_type" list="doc-types" maxlength="100" placeholder="例: 手順書">
+            <datalist id="doc-types">
+              <option value="設計書"></option>
+              <option value="仕様書"></option>
+              <option value="手順書"></option>
+              <option value="運用マニュアル"></option>
+              <option value="README"></option>
+            </datalist>
+          </label>
+        </div>
+        <label>作成指示
+          <span class="hint">目的・想定読者・含めるべき内容などを書いてください。関連するWikiはConfluenceから自動で検索します。</span>
+          <textarea name="instruction" rows="6" required></textarea>
+        </label>
+        <label>レビュー観点
+          <span class="hint">自動レビューで確認する観点（例: 手順に抜けがないか、セキュリティ上の問題がないか）</span>
+          <textarea name="viewpoints" rows="4"></textarea>
+        </label>
+
+        <div class="grid2">
+          <fieldset data-kind="generation">
+            <legend>生成用Skills</legend>
+            <span class="hint">選んだSkillsの中から、必要なものをLLMが選んで利用します。</span>
+            <div class="builtin"><p class="empty">読み込み中…</p></div>
+            <label>SKILL.md をアップロード
+              <input type="file" accept=".md,text/markdown,text/plain" multiple>
+            </label>
+            <label>SKILL.md を貼り付け
+              <textarea rows="4" placeholder="---&#10;name: my-skill&#10;description: いつ使うSkillか&#10;---&#10;# 手順や規約"></textarea>
+            </label>
+            <button type="button" class="add-pasted">貼り付けたSkillを追加</button>
+            <ul class="chips"></ul>
+          </fieldset>
+          <fieldset data-kind="review">
+            <legend>レビュー用Skills</legend>
+            <span class="hint">選んだSkillsの中から、レビュー観点に必要なものをLLMが選んで利用します。</span>
+            <div class="builtin"><p class="empty">読み込み中…</p></div>
+            <label>SKILL.md をアップロード
+              <input type="file" accept=".md,text/markdown,text/plain" multiple>
+            </label>
+            <label>SKILL.md を貼り付け
+              <textarea rows="4" placeholder="---&#10;name: my-review-skill&#10;description: いつ使うSkillか&#10;---&#10;# 確認観点"></textarea>
+            </label>
+            <button type="button" class="add-pasted">貼り付けたSkillを追加</button>
+            <ul class="chips"></ul>
+          </fieldset>
+        </div>
+
+        <label>最大レビュー回数
+          <span class="hint">自動レビューで指摘がなくなるか、この回数に達するまで自動修正を繰り返します。</span>
+          <input type="number" name="max_reviews" value="10" min="1" max="100" required>
+        </label>
+        <div class="row">
+          <button type="submit" class="primary">実行</button>
+        </div>
+        <p id="form-message" class="message" role="status"></p>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>最近のジョブ</h2>
+      <div class="table-wrap">
+        <table id="jobs">
+          <thead><tr><th>ドキュメント名</th><th>種類</th><th>状態</th><th>最新版</th><th>レビュー回数</th><th>更新日時</th></tr></thead>
+          <tbody><tr><td colspan="6" class="empty">読み込み中…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+  <script src="app.js"></script>
+  <script>initNewJobPage();</script>
+</body>
+</html>

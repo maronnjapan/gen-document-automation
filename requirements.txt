@@ -1,0 +1,6 @@
+# 生成・レビューアプリ（Lambda）とAPIの共通依存
+boto3==1.44.3
+redis==8.1.0
+requests==2.34.2
+PyYAML==6.0.3
+markdownify==1.2.3
